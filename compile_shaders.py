@@ -1,8 +1,4 @@
 # shader compile script
-# each shader's entry points are enumerated, and the script will try to compile
-# debug and optimized version for each entry point.
-# the script is on a loop, and constantly checks if shaders need to be
-# recompiled.
 
 import os
 import time
@@ -14,51 +10,122 @@ import re
 import inc_bin
 import argparse
 
-SHADER_DIR = None
-OUT_DIR = None
 ENTRY_POINT_TAG = 'entry-point'
+SHADER_DECL_RE = re.compile('(.+)? (.+)\(.*')
+ENTRY_POINT_RE = re.compile('// entry-point: (.+)')
+FULL_SCREEN_ENTRY_POINT_RE = re.compile('// full-screen-entry-point: (.+)')
+CBUFFER_RANGE_RE = re.compile('// (.+): range (.+)\.\.(.+)')
+CBUFFER_SHADER_RE = re.compile('// shader: (.+)')
+CBUFFER_TYPE_RE = re.compile('// (.+): type (.+)')
+DEPS_RE = re.compile('#include "(.+?)"')
 
 # for each file, contain list of entry-points by shader type
 SHADERS = {}
 SHADER_FILES = set()
-
-SHADER_DECL_RE = re.compile('(.+)? (.+)\(.*')
-ENTRY_POINT_RE = re.compile('// entry-point: (.+)')
-DEPS_RE = re.compile('#include "(.+?)"')
-
 DEPS = defaultdict(set)
+LAST_FAIL_TIME = {}
+
+SHADER_DIR = None
+OUT_DIR = None
+
+SHADER_DATA = {
+    'vs': {'profile': 'vs', 'obj_ext': 'vso', 'asm_ext': 'vsa'},
+    'gs': {'profile': 'gs', 'obj_ext': 'gso', 'asm_ext': 'gsa'},
+    'ps': {'profile': 'ps', 'obj_ext': 'pso', 'asm_ext': 'psa'},
+    'cs': {'profile': 'cs', 'obj_ext': 'cso', 'asm_ext': 'csa'},
+}
+
+# conversion between HLSL and my types
+KNOWN_TYPES = {
+    'float': {'type': 'float', 'size': 1},
+    'float2': {'type': 'vec2', 'size': 2},
+    'float3': {'type': 'vec3', 'size': 3},
+    'float4': {'type': 'vec4', 'size': 4},
+    'float4x4': {'type': 'Matrix', 'size': 16},
+    'matrix': {'type': 'Matrix', 'size': 16},
+}
+
+CBUFFER_NAMESPACE = None
+CBUFFER_TEMPLATE = Template("""#pragma once
+namespace $namespace
+{
+  namespace cb
+  {
+$cbuffers
+  }
+}
+""")
 
 
-def strip_dirs(f):
-    return f.rpartition('\\')[2]
+def safe_mkdir(path):
+    try:
+        os.mkdir(path)
+    except OSError:
+        pass
 
 
-def get_shader_root(f):
-    # given "c:/temp/shader.hlsl" returns "shader"
-    _, tail = os.path.split(f)
-    root, _ = os.path.splitext(tail)
-    return root
-
-
-def entry_points_for_file(f):
-    """ find the shader entry points and deps for the given file """
+def parse_hlsl_file(f):
+    # scan the hlsl file, and look for:
+    # - entry points
+    # - dependencies
+    # - cbuffer meta
     res = defaultdict(list)
     deps = set()
+    cbuffer_meta = defaultdict(dict)
+    cur_cbuffer_shader = None
     _, filename = os.path.split(f)
     entry_point_type = None
+    full_screen_entry_point = None
+    in_cbuffer_meta = False
     for r in open(f, 'rt').readlines():
         r = r.strip()
-        if entry_point_type:
+
+        # Check for c-buffer meta data
+        if in_cbuffer_meta:
+            if r == '// cb-meta-end':
+                in_cbuffer_meta = False
+                cur_cbuffer_shader = None
+                continue
+
+            m = CBUFFER_SHADER_RE.match(r)
+            if m:
+                # associate this cbuffer with a shader, and create the cbuffer
+                # dict
+                cur_cbuffer_shader = m.groups()[0]
+                cbuffer_meta[cur_cbuffer_shader] = defaultdict(dict)
+            else:
+                if not cur_cbuffer_shader:
+                    print 'Unassociated cbuffer (missing "shader" command)'
+                    continue
+
+            m = CBUFFER_RANGE_RE.match(r)
+            if m:
+                g = m.groups()
+                cbuffer_meta[cur_cbuffer_shader][g[0]]['range'] = [
+                    float(g[1]), float(g[2])]
+
+            m = CBUFFER_TYPE_RE.match(r)
+            if m:
+                g = m.groups()
+                cbuffer_meta[cur_cbuffer_shader][g[0]]['type'] = g[1]
+
+        elif r == '// cb-meta-begin':
+            in_cbuffer_meta = True
+        elif entry_point_type:
             # previous row was an entry point, so parse the entry point
             # name
             m = SHADER_DECL_RE.match(r)
             if m:
                 name = m.groups()[1]
-                res[entry_point_type].append(name)
+                res[entry_point_type].append((name, full_screen_entry_point))
             entry_point_type = None
+            full_screen_entry_point = None
         else:
-            m = ENTRY_POINT_RE.match(r)
-            if m:
+            m0 = ENTRY_POINT_RE.match(r)
+            m1 = FULL_SCREEN_ENTRY_POINT_RE.match(r)
+            full_screen_entry_point = m1 is not None
+            if m0 or m1:
+                m = m0 if m0 else m1
                 t = m.groups()[0]
                 if t in ('vs', 'ps', 'gs', 'cs'):
                     # found correct entry point tag
@@ -70,132 +137,23 @@ def entry_points_for_file(f):
                 if m:
                     deps.add(m.groups()[0])
 
-    return res, deps
-
-shader_data = {
-    'vs': {'profile': 'vs', 'obj_ext': 'vso', 'asm_ext': 'vsa'},
-    'gs': {'profile': 'gs', 'obj_ext': 'gso', 'asm_ext': 'gsa'},
-    'ps': {'profile': 'ps', 'obj_ext': 'pso', 'asm_ext': 'psa'},
-    'cs': {'profile': 'cs', 'obj_ext': 'cso', 'asm_ext': 'csa'},
-}
-
-last_fail_time = {}
+    return res, deps, cbuffer_meta
 
 
-def safe_mkdir(path):
-    try:
-        os.mkdir(path)
-    except OSError:
-        pass
-
-
-def filetime_is_newer(time, filename):
-    try:
-        obj_time = os.path.getmtime(filename)
-        return time > obj_time
-    except:
-        return True
-
-
-def generate_files(base, entry_points, obj_ext, asm_ext):
+def generate_filenames(base, entry_points, obj_ext, asm_ext):
     # returns the output files from the given base and entry points
     res = []
-    for e in entry_points:
+    for entry_point in entry_points:
+        e, is_fullscreen = entry_point
         res.append((base + '_' + e + '.' + obj_ext, e, False))
         res.append((base + '_' + e + '.' + asm_ext, e, False))
         res.append((base + '_' + e + 'D.' + obj_ext, e, True))
         res.append((base + '_' + e + 'D.' + asm_ext, e, True))
     return res
 
-# conversion between HLSL and my types
-known_types = {
-    'float': {'type': 'float', 'size': 1},
-    'float2': {'type': 'vec2', 'size': 2},
-    'float3': {'type': 'vec3', 'size': 3},
-    'float4': {'type': 'vec4', 'size': 4},
-    'float4x4': {'type': 'Matrix', 'size': 16},
-    'matrix': {'type': 'Matrix', 'size': 16},
-}
 
-buffer_template = Template("""#pragma once
-namespace tokko
-{
-  namespace cb
-  {
-$cbuffers
-  }
-}
-""")
-
-
-def dump_cbuffer(cbuffer_filename, cbuffers):
-
-    num_valid = 0
-    bufs = []
-    for c in cbuffers:
-        name = c['name']
-        vars = c['vars']
-
-        # skip writing the cbuffer if all the vars are unused
-        if len(vars) == c['unused']:
-            continue
-        num_valid += 1
-
-        cur = '    struct %s\n    {\n' % name
-
-        # calc max line length to align the comments
-        max_len = 0
-        for n, (var_data, comments) in vars.iteritems():
-            t = var_data['type']
-            max_len = max(max_len, len(n) + len(t))
-
-        padder = 0
-        slots_left = 4
-        for n, (var_data, comments) in vars.iteritems():
-            var_type = var_data['type']
-            var_size = var_data.get('size', None)
-            # if the current variable doesn't fit in the remaining
-            # slots, align it
-            if (
-                slots_left != 4 and
-                slots_left - var_size < 0
-            ):
-                cur += (
-                    '      float padding%s[%s];\n' %
-                    (padder, slots_left)
-                )
-                padder += 1
-                slots_left = 4
-            cur_len = len(n) + len(var_type)
-            padding = (max_len - cur_len + 8) * ' '
-            cur += '      %s %s;%s%s\n' % (var_type, n, padding, comments)
-            slots_left -= (var_size % 4)
-            if slots_left == 0:
-                slots_left = 4
-        cur += '    };'
-
-        bufs.append(cur)
-
-    if num_valid:
-        res = buffer_template.substitute({'cbuffers': '\n'.join(bufs)})
-
-        # check if this is identical to the previous cbuffer
-        identical = False
-        try:
-            with open(cbuffer_filename, 'rt') as f:
-                identical = f.read() == res
-        except IOError:
-            pass
-
-        if not identical:
-            with open(cbuffer_filename, 'wt') as f:
-                f.write(res)
-
-
-def parse_cbuffer(basename, entry_point, out_name, ext):
-
-    filename = out_name + '.' + ext
-    cbuffer_filename = (out_name + '.cbuffers.hpp').lower()
+def parse_cbuffer(basename, asm_filename):
+    """ Parses the asm-file, and collects the cbuffer variables """
 
     cbuffer_prefix = basename.title().replace('.', '')
 
@@ -203,9 +161,10 @@ def parse_cbuffer(basename, entry_point, out_name, ext):
     cur_cbuffer = None
     cur_input_sig = None
     try:
-        with open(filename) as f:
+        with open(asm_filename) as f:
             lines = f.readlines()
     except:
+        print 'file not found parsing cbuffers: %s' % asm_filename
         return
 
     skip_count = 0
@@ -260,52 +219,160 @@ def parse_cbuffer(basename, entry_point, out_name, ext):
         var_type, _, var_name = tmp.partition(' ')
         if not var_type or not var_name:
             continue
-        if var_type not in known_types:
+        if var_type not in KNOWN_TYPES:
             continue
-        cur_cbuffer['vars'][var_name] = (known_types[var_type], comments)
+        cur_cbuffer['vars'][var_name] = (KNOWN_TYPES[var_type], comments)
 
-    dump_cbuffer(cbuffer_filename, cbuffers)
+    return cbuffers
 
 
-def should_compile(f):
+def save_cbuffer(cbuffer_filename, cbuffers):
+    """ write the cbuffers to the given header file as a struct """
+    num_valid = 0
+    bufs = []
+    for c in cbuffers:
+        name = c['name']
+        vars = c['vars']
+
+        # skip writing the cbuffer if all the vars are unused
+        if len(vars) == c['unused']:
+            continue
+        num_valid += 1
+
+        cur = '    struct %s\n    {\n' % name
+
+        # calc max line length to align the comments
+        max_len = 0
+        for n, (var_data, comments) in vars.iteritems():
+            t = var_data['type']
+            max_len = max(max_len, len(n) + len(t))
+
+        padder = 0
+        slots_left = 4
+        for n, (var_data, comments) in vars.iteritems():
+            var_type = var_data['type']
+            var_size = var_data.get('size', None)
+            # if the current variable doesn't fit in the remaining slots,
+            # align it
+            if (slots_left != 4 and slots_left - var_size < 0):
+                cur += (
+                    '      float padding%s[%s];\n' %
+                    (padder, slots_left)
+                )
+                padder += 1
+                slots_left = 4
+            cur_len = len(n) + len(var_type)
+            padding = (max_len - cur_len + 8) * ' '
+            cur += '      %s %s;%s%s\n' % (var_type, n, padding, comments)
+            slots_left -= (var_size % 4)
+            if slots_left == 0:
+                slots_left = 4
+        cur += '    };'
+
+        bufs.append(cur)
+
+    if num_valid:
+        res = CBUFFER_TEMPLATE.substitute({
+            'cbuffers': '\n'.join(bufs),
+            'namespace': CBUFFER_NAMESPACE,
+        })
+
+        # check if this is identical to the previous cbuffer
+        identical = False
+        try:
+            with open(cbuffer_filename, 'rt') as f:
+                identical = f.read() == res
+        except IOError:
+            pass
+
+        if not identical:
+            with open(cbuffer_filename, 'wt') as f:
+                f.write(res)
+
+
+def save_manifest(root, cbuffers, cbuffer_meta):
+    # the manifest contains information about all the (pixel) shaders in a
+    # hlsl file, along with the cbuffer data. the idea is that using this
+    # data, we can automatically load shaders and create imgui displays for
+    # them.
+    manifest_file = os.path.join(OUT_DIR, root + '.manifest')
+    with open(manifest_file, 'wt') as f:
+        for shader in SHADERS.get(root, {}).get('ps', []):
+            shader, is_fullscreen = shader
+            meta = cbuffer_meta.get(shader)
+            if not is_fullscreen:
+                continue
+            f.write('shader-begin\n')
+            f.write('name: %s\n' % shader)
+            f.write('file: %s\n' % os.path.join(
+                    OUT_DIR, root + '_' + shader + '.pso'))
+            f.write('cbuffer-begin\n')
+            for cbs in cbuffers.get(shader, {}):
+                for key, value in cbs.get('vars', {}).iteritems():
+                    if meta and key in meta:
+                        if 'type' in meta[key]:
+                            val_type = meta[key]['type']
+                        else:
+                            val_type = value[0]['type']
+
+                        if 'range' in meta[key]:
+                            m = meta[key]
+                            f.write(
+                                'name: %s type: %s min: %s max: %s\n' % (
+                                    key, val_type,
+                                    m['range'][0], m['range'][1]))
+                        else:
+                            f.write('name: %s type: %s\n' % (key, val_type))
+                    else:
+                        f.write(
+                            'name: %s type: %s\n' % (key, value[0]['type']))
+            f.write('cbuffer-end\n')
+            f.write('shader-end\n')
+
+
+def should_compile(full_path):
     # first step is to see if the shader has a .status file - if it doesn't
     # then it's never been compiled
-    path, filename = os.path.split(f)
-    status_file = os.path.join(OUT_DIR, filename + '.status')
+    path, root = os.path.split(full_path)
+    status_file = os.path.join(OUT_DIR, root + '.status')
     if not os.path.exists(status_file):
         return True
 
     # status = open(status_file, 'rt').readline().strip()
     status_date = os.path.getmtime(status_file)
-    hlsl_date = os.path.getmtime(filename)
+    hlsl_date = os.path.getmtime(full_path)
 
     # if the hlsl file has any deps, check the dates of those too
-    for dep in DEPS(filename):
+    for dep in DEPS[root]:
         full_dep = os.path.join(path, dep)
         hlsl_date = max(hlsl_date, os.path.getmtime(full_dep))
 
-    if status_date >= hlsl_date:
-        return False
+    return status_date < hlsl_date
 
 
-def compile(full_path, root):
+def compile(full_path, root, cbuffer_meta):
+    # shader_file =  ..\shaders\landscape.landscape
+    shader_file = os.path.join(SHADER_DIR, root)
+    hlsl_file = shader_file + '.hlsl'
+    hlsl_file_time = os.path.getmtime(hlsl_file)
+    status_file = os.path.join(OUT_DIR, root + '.hlsl.status')
+    with open(status_file, 'wt') as f:
+        f.write('OK\n')
+
+    cbuffers = {}
+
     for shader_type, entry_points in SHADERS[root].iteritems():
-        profile = shader_data[shader_type]['profile']
-        obj_ext = shader_data[shader_type]['obj_ext']
-        asm_ext = shader_data[shader_type]['asm_ext']
-
-        # shader_file =  ..\shaders\landscape.landscape
-        shader_file = os.path.join(SHADER_DIR, root)
-        hlsl_file = shader_file + '.hlsl'
-        hlsl_file_time = os.path.getmtime(hlsl_file)
-        status_file = hlsl_file + '.status'
-        with open(status_file, 'wt') as f:
-            f.write('OK\n')
+        profile = SHADER_DATA[shader_type]['profile']
+        obj_ext = SHADER_DATA[shader_type]['obj_ext']
+        asm_ext = SHADER_DATA[shader_type]['asm_ext']
 
         # compile all the entry points
-        g = generate_files(root, entry_points, obj_ext, asm_ext)
+        g = generate_filenames(root, entry_points, obj_ext, asm_ext)
         for output, entry_point, is_debug in g:
-            out_name = os.path.join(OUT_DIR, root + '_' + entry_point)
+            out_root = os.path.join(OUT_DIR, root + '_' + entry_point)
+            suffix = 'D' if is_debug else ''
+            obj_file = out_root + suffix + '.' + obj_ext
+            asm_file = out_root + suffix + '.' + asm_ext
 
             if is_debug:
                 # create debug shader
@@ -317,8 +384,8 @@ def compile(full_path, root):
                     '/Od',
                     '/Zi',
                     '/E%s' % entry_point,
-                    '/Fo%sD.%s' % (out_name, obj_ext),
-                    '/Fc%sD.%s' % (out_name, asm_ext),
+                    '/Fo%s' % (obj_file),
+                    '/Fc%s' % (asm_file),
                     '%s.hlsl' % shader_file])
             else:
                 # create optimized shader
@@ -328,9 +395,9 @@ def compile(full_path, root):
                     '/T%s_5_0' % profile,
                     '/O3',
                     '/E%s' % entry_point,
-                    '/Fo%s.%s' % (out_name, obj_ext),
-                    '/Fc%s.%s' % (out_name, asm_ext),
-                    # '/Qstrip_debug',
+                    '/Fo%s' % (obj_file),
+                    '/Fc%s' % (asm_file),
+                    '/Qstrip_debug',
                     '/Qstrip_reflect',
                     '/Vd',
                     '%s.hlsl' % shader_file])
@@ -338,28 +405,34 @@ def compile(full_path, root):
                 # if compilation failed, don't try again until the
                 # .hlsl file has been updated
                 print '** FAILURE: %s, %s' % (shader_file, entry_point)
-                last_fail_time[shader_file] = hlsl_file_time
+                LAST_FAIL_TIME[shader_file] = hlsl_file_time
             else:
                 if not is_debug:
-                    inc_bin.dump_bin(out_name + '.' + obj_ext)
-                parse_cbuffer(root, entry_point, out_name, asm_ext)
-                if shader_file in last_fail_time:
-                    del(last_fail_time[shader_file])
+                    inc_bin.dump_bin(obj_file)
+
+                if is_debug:
+                    cb = parse_cbuffer(root, asm_file)
+                    if shader_type == 'ps':
+                        cbuffers[entry_point] = cb
+                    if CBUFFER_NAMESPACE:
+                        cbuffer_filename = (out_root + '.cbuffers.hpp').lower()
+                        save_cbuffer(cbuffer_filename, cb)
+
+                if shader_file in LAST_FAIL_TIME:
+                    del(LAST_FAIL_TIME[shader_file])
+
+    save_manifest(root, cbuffers, cbuffer_meta)
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-d', '--shader_dir', default='shaders')
-parser.add_argument('-o', '--out_dir', default='out')
+parser.add_argument('-d', '--shader-dir', default='shaders')
+parser.add_argument('-o', '--out-dir', default='out')
+parser.add_argument('-bin', '--binary', action='store_true')
+parser.add_argument(
+    '-cb', '--constant-buffer', help='Constant buffer namespace')
 args = parser.parse_args()
 SHADER_DIR = args.shader_dir
 OUT_DIR = os.path.join(args.shader_dir, args.out_dir)
-
-# find any deps
-for f in glob.glob(os.path.join(SHADER_DIR, '*.hlsl')):
-    for row in open(f).readlines():
-        m = DEPS_RE.match(row)
-        if m:
-            dependant = m.groups()[0]
-            DEPS[strip_dirs(f)].add(dependant)
+CBUFFER_NAMESPACE = args.constant_buffer
 
 try:
     prev_files = set()
@@ -368,6 +441,9 @@ try:
         cur_files = set()
         first_tick = True
         for full_path in glob.glob(os.path.join(SHADER_DIR, '*.hlsl')):
+            _, filename = os.path.split(full_path)
+            root, ext = os.path.splitext(filename)
+            cur_files.add(root)
             if should_compile(full_path):
                 # If first modified file, print header
                 if first_tick:
@@ -377,12 +453,9 @@ try:
                         ll.tm_hour, ll.tm_min, ll.tm_sec)
                 # the hlsl file has changed, so reparse it's deps and entry
                 # points
-                eps, deps = entry_points_for_file(full_path)
-                _, filename = os.path.split(full_path)
-                root, ext = os.path.splitext(filename)
-                SHADERS[root] = eps
+                entry_points, deps, cbuffer_meta = parse_hlsl_file(full_path)
+                SHADERS[root] = entry_points
                 DEPS[root] = deps
-                cur_files.add(root)
 
                 for row in open(full_path).readlines():
                     m = DEPS_RE.match(row)
@@ -390,12 +463,16 @@ try:
                         dependant = m.groups()[0]
                         DEPS[root].add(dependant)
 
-                compile(full_path, root)
+                compile(full_path, root, cbuffer_meta)
 
-            # purge data from files that no longer exist
-            for root in prev_files.difference(cur_files):
+        # purge data from files that no longer exist
+        for root in prev_files.difference(cur_files):
+            if root in SHADERS:
                 del SHADERS[root]
+            if root in DEPS:
                 del DEPS[root]
+
+        prev_files = cur_files
 
         time.sleep(1)
 except KeyboardInterrupt:
