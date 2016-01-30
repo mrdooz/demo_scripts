@@ -14,9 +14,12 @@ ENTRY_POINT_TAG = 'entry-point'
 SHADER_DECL_RE = re.compile('(.+)? (.+)\(.*')
 ENTRY_POINT_RE = re.compile('// entry-point: (.+)')
 FULL_SCREEN_ENTRY_POINT_RE = re.compile('// full-screen-entry-point: (.+)')
-CBUFFER_RANGE_RE = re.compile('// (.+): range (.+)\.\.(.+)')
-CBUFFER_SHADER_RE = re.compile('// shader: (.+)')
-CBUFFER_TYPE_RE = re.compile('// (.+): type (.+)')
+CBUFFER_META_BEGIN_RE = re.compile('// cb-meta-begin: (.+)')
+CBUFFER_META_END_RE = re.compile('// cb-meta-end')
+CBUFFER_RANGE_RE = re.compile('// (.+): range: (.+)\.\.(.+)')
+CBUFFER_TYPE_RE = re.compile('// (.+): type: (.+)')
+# cbuffer cbRadialGradient : register(b1)
+CBUFFER_RE = re.compile('cbuffer (.+) : .+')
 DEPS_RE = re.compile('#include "(.+?)"')
 
 # for each file, contain list of entry-points by shader type
@@ -72,45 +75,49 @@ def parse_hlsl_file(f):
     res = defaultdict(list)
     deps = set()
     cbuffer_meta = defaultdict(dict)
-    cur_cbuffer_shader = None
+    cbuffer_shader = None
+    parse_cbuffer_header = False
     _, filename = os.path.split(f)
     entry_point_type = None
     full_screen_entry_point = None
-    in_cbuffer_meta = False
     for r in open(f, 'rt').readlines():
         r = r.strip()
 
-        # Check for c-buffer meta data
-        if in_cbuffer_meta:
-            if r == '// cb-meta-end':
-                in_cbuffer_meta = False
-                cur_cbuffer_shader = None
-                continue
-
-            m = CBUFFER_SHADER_RE.match(r)
+        if parse_cbuffer_header:
+            # the previous row was a cbuffer meta end, so we parse the cbuffer
+            # definition now to get the name
+            m = CBUFFER_RE.match(r)
             if m:
-                # associate this cbuffer with a shader, and create the cbuffer
-                # dict
-                cur_cbuffer_shader = m.groups()[0]
-                cbuffer_meta[cur_cbuffer_shader] = defaultdict(dict)
-            else:
-                if not cur_cbuffer_shader:
-                    print 'Unassociated cbuffer (missing "shader" command)'
-                    continue
+                cbuffer_meta[cbuffer_shader]['cbuffer'] = m.groups()[0]
+            parse_cbuffer_header = False
+            cbuffer_shader = None
+            continue
+
+        # Check for c-buffer meta data
+        if cbuffer_shader:
+            if CBUFFER_META_END_RE.match(r):
+                parse_cbuffer_header = True
+                continue
 
             m = CBUFFER_RANGE_RE.match(r)
             if m:
                 g = m.groups()
-                cbuffer_meta[cur_cbuffer_shader][g[0]]['range'] = [
+                cbuffer_meta[cbuffer_shader][g[0]]['range'] = [
                     float(g[1]), float(g[2])]
 
             m = CBUFFER_TYPE_RE.match(r)
             if m:
                 g = m.groups()
-                cbuffer_meta[cur_cbuffer_shader][g[0]]['type'] = g[1]
+                cbuffer_meta[cbuffer_shader][g[0]]['type'] = g[1]
+            continue
 
-        elif r == '// cb-meta-begin':
-            in_cbuffer_meta = True
+        m = CBUFFER_META_BEGIN_RE.match(r)
+        if m:
+            # associate this cbuffer with a shader, and create the cbuffer
+            # dict
+            cbuffer_shader = m.groups()[0]
+            cbuffer_meta[cbuffer_shader] = defaultdict(dict)
+
         elif entry_point_type:
             # previous row was an entry point, so parse the entry point
             # name
@@ -182,6 +189,7 @@ def parse_cbuffer(basename, asm_filename):
             name = line[len('cbuffer '):]
             cur_cbuffer = {
                 'name': cbuffer_prefix + name,
+                'root': name,
                 'vars': OrderedDict(),
                 'unused': 0,
             }
@@ -299,17 +307,25 @@ def save_manifest(root, cbuffers, cbuffer_meta):
     with open(manifest_file, 'wt') as f:
         for shader in SHADERS.get(root, {}).get('ps', []):
             shader, is_fullscreen = shader
+            # only write manifests for fullscreen shaders with cbuffer meta
+            # data
             meta = cbuffer_meta.get(shader)
-            if not is_fullscreen:
+            if not is_fullscreen or not meta:
                 continue
-            f.write('shader-begin\n')
-            f.write('name: %s\n' % shader)
-            f.write('file: %s\n' % os.path.join(
-                    OUT_DIR, root + '_' + shader + '.pso'))
+            f.write('shader-begin name: %s file: %s\n' % (
+                shader, os.path.join(OUT_DIR, root + '_' + shader + '.pso')))
+
             f.write('cbuffer-begin\n')
+            # for the current shader, find the cbuffer with associated meta
+            cur_cbuffer = cbuffer_meta[shader]['cbuffer']
+
             for cbs in cbuffers.get(shader, {}):
+                if cbs['root'] != cur_cbuffer:
+                    continue
+
                 for key, value in cbs.get('vars', {}).iteritems():
-                    if meta and key in meta:
+                    # look for metadata associated with the current var
+                    if key in meta:
                         if 'type' in meta[key]:
                             val_type = meta[key]['type']
                         else:
