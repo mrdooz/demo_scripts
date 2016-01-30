@@ -376,6 +376,7 @@ def compile(full_path, root, cbuffer_meta):
         f.write('OK\n')
 
     cbuffers = {}
+    compile_res = { 'ok': set(), 'fail': set() }
 
     for shader_type, entry_points in SHADERS[root].iteritems():
         profile = SHADER_DATA[shader_type]['profile']
@@ -422,7 +423,9 @@ def compile(full_path, root, cbuffer_meta):
                 # .hlsl file has been updated
                 print '** FAILURE: %s, %s' % (shader_file, entry_point)
                 LAST_FAIL_TIME[shader_file] = hlsl_file_time
+                compile_res['fail'].add(entry_point)
             else:
+                compile_res['ok'].add(entry_point)
                 if not is_debug:
                     inc_bin.dump_bin(obj_file)
 
@@ -437,7 +440,9 @@ def compile(full_path, root, cbuffer_meta):
                 if shader_file in LAST_FAIL_TIME:
                     del(LAST_FAIL_TIME[shader_file])
 
-    save_manifest(root, cbuffers, cbuffer_meta)
+    if len(compile_res['fail']) == 0:
+        save_manifest(root, cbuffers, cbuffer_meta)
+    return compile_res
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-d', '--shader-dir', default='shaders')
