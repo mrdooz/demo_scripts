@@ -59,6 +59,13 @@ $cbuffers
 }
 """)
 
+CBUFFER_TEMPLATE_NO_NS = Template("""#pragma once
+namespace cb
+{
+$cbuffers
+}
+""")
+
 
 def safe_mkdir(path):
     try:
@@ -280,10 +287,15 @@ def save_cbuffer(cbuffer_filename, cbuffers):
         bufs.append(cur)
 
     if num_valid:
-        res = CBUFFER_TEMPLATE.substitute({
-            'cbuffers': '\n'.join(bufs),
-            'namespace': CBUFFER_NAMESPACE,
-        })
+        if CBUFFER_NAMESPACE:
+            res = CBUFFER_TEMPLATE.substitute({
+                'cbuffers': '\n'.join(bufs),
+                'namespace': CBUFFER_NAMESPACE,
+            })
+        else:
+            res = CBUFFER_TEMPLATE_NO_NS.substitute({
+                'cbuffers': '\n'.join(bufs),
+            })
 
         # check if this is identical to the previous cbuffer
         identical = False
@@ -433,9 +445,9 @@ def compile(full_path, root, cbuffer_meta):
                     cb = parse_cbuffer(root, asm_file)
                     if shader_type == 'ps':
                         cbuffers[entry_point] = cb
-                    if CBUFFER_NAMESPACE:
-                        cbuffer_filename = (out_root + '.cbuffers.hpp').lower()
-                        save_cbuffer(cbuffer_filename, cb)
+
+                    cbuffer_filename = (out_root + '.cbuffers.hpp').lower()
+                    save_cbuffer(cbuffer_filename, cb)
 
                 if shader_file in LAST_FAIL_TIME:
                     del(LAST_FAIL_TIME[shader_file])
