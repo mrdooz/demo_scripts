@@ -1,4 +1,4 @@
-# shader compile script
+"""shader compile script."""
 
 import os
 import time
@@ -59,7 +59,7 @@ $cbuffers
 }
 """)
 
-CBUFFER_TEMPLATE_NO_NS = Template("""#pragma once
+CBUFFER_TEMPLATE_RAW = Template("""#pragma once
 namespace cb
 {
 $cbuffers
@@ -67,14 +67,14 @@ $cbuffers
 """)
 
 
-def safe_mkdir(path):
+def _safe_mkdir(path):
     try:
         os.mkdir(path)
     except OSError:
         pass
 
 
-def parse_hlsl_file(f):
+def _parse_hlsl_file(f):
     # scan the hlsl file, and look for:
     # - entry points
     # - dependencies
@@ -154,7 +154,7 @@ def parse_hlsl_file(f):
     return res, deps, cbuffer_meta
 
 
-def generate_filenames(base, entry_points, obj_ext, asm_ext):
+def _generate_filenames(base, entry_points, obj_ext, asm_ext):
     # returns the output files from the given base and entry points
     res = []
     for entry_point in entry_points:
@@ -166,8 +166,8 @@ def generate_filenames(base, entry_points, obj_ext, asm_ext):
     return res
 
 
-def parse_cbuffer(basename, asm_filename):
-    """ Parses the asm-file, and collects the cbuffer variables """
+def _parse_cbuffer(basename, asm_filename):
+    # Parses the asm-file, and collects the cbuffer variables
 
     cbuffer_prefix = basename.title().replace('.', '')
 
@@ -241,10 +241,11 @@ def parse_cbuffer(basename, asm_filename):
     return cbuffers
 
 
-def save_cbuffer(cbuffer_filename, cbuffers):
-    """ write the cbuffers to the given header file as a struct """
+def _save_cbuffer(cbuffer_filename, cbuffers):
+    """Write the cbuffers to the given header file as a struct."""
     num_valid = 0
     bufs = []
+    indent = 4 * ' ' if CBUFFER_NAMESPACE else 2 * ' '
     for c in cbuffers:
         name = c['name']
         vars = c['vars']
@@ -254,7 +255,7 @@ def save_cbuffer(cbuffer_filename, cbuffers):
             continue
         num_valid += 1
 
-        cur = '    struct %s\n    {\n' % name
+        cur = '%sstruct %s\n    {\n' % (indent, name)
 
         # calc max line length to align the comments
         max_len = 0
@@ -271,8 +272,8 @@ def save_cbuffer(cbuffer_filename, cbuffers):
             # align it
             if (slots_left != 4 and slots_left - var_size < 0):
                 cur += (
-                    '      float padding%s[%s];\n' %
-                    (padder, slots_left)
+                    '%sfloat padding%s[%s];\n' %
+                    (indent, padder, slots_left)
                 )
                 padder += 1
                 slots_left = 4
@@ -282,7 +283,7 @@ def save_cbuffer(cbuffer_filename, cbuffers):
             slots_left -= (var_size % 4)
             if slots_left == 0:
                 slots_left = 4
-        cur += '    };'
+        cur += '%s};' % (indent)
 
         bufs.append(cur)
 
@@ -293,8 +294,8 @@ def save_cbuffer(cbuffer_filename, cbuffers):
                 'namespace': CBUFFER_NAMESPACE,
             })
         else:
-            res = CBUFFER_TEMPLATE_NO_NS.substitute({
-                'cbuffers': '\n'.join(bufs),
+            res = CBUFFER_TEMPLATE_RAW.substitute({
+                'cbuffers': '\n'.join(bufs)
             })
 
         # check if this is identical to the previous cbuffer
@@ -310,7 +311,7 @@ def save_cbuffer(cbuffer_filename, cbuffers):
                 f.write(res)
 
 
-def save_manifest(root, cbuffers, cbuffer_meta):
+def _save_manifest(root, cbuffers, cbuffer_meta):
     # the manifest contains information about all the (pixel) shaders in a
     # hlsl file, along with the cbuffer data. the idea is that using this
     # data, we can automatically load shaders and create imgui displays for
@@ -358,7 +359,7 @@ def save_manifest(root, cbuffers, cbuffer_meta):
             f.write('shader-end\n')
 
 
-def should_compile(full_path):
+def _should_compile(full_path):
     # first step is to see if the shader has a .status file - if it doesn't
     # then it's never been compiled
     path, root = os.path.split(full_path)
@@ -378,7 +379,7 @@ def should_compile(full_path):
     return status_date < hlsl_date
 
 
-def compile(full_path, root, cbuffer_meta):
+def _compile(full_path, root, cbuffer_meta):
     # shader_file =  ..\shaders\landscape.landscape
     shader_file = os.path.join(SHADER_DIR, root)
     hlsl_file = shader_file + '.hlsl'
@@ -388,7 +389,7 @@ def compile(full_path, root, cbuffer_meta):
         f.write('OK\n')
 
     cbuffers = {}
-    compile_res = { 'ok': set(), 'fail': set() }
+    compile_res = {'ok': set(), 'fail': set()}
 
     for shader_type, entry_points in SHADERS[root].iteritems():
         profile = SHADER_DATA[shader_type]['profile']
@@ -396,7 +397,7 @@ def compile(full_path, root, cbuffer_meta):
         asm_ext = SHADER_DATA[shader_type]['asm_ext']
 
         # compile all the entry points
-        g = generate_filenames(root, entry_points, obj_ext, asm_ext)
+        g = _generate_filenames(root, entry_points, obj_ext, asm_ext)
         for output, entry_point, is_debug in g:
             out_root = os.path.join(OUT_DIR, root + '_' + entry_point)
             suffix = 'D' if is_debug else ''
@@ -442,18 +443,17 @@ def compile(full_path, root, cbuffer_meta):
                     inc_bin.dump_bin(obj_file)
 
                 if is_debug:
-                    cb = parse_cbuffer(root, asm_file)
+                    cb = _parse_cbuffer(root, asm_file)
                     if shader_type == 'ps':
                         cbuffers[entry_point] = cb
-
                     cbuffer_filename = (out_root + '.cbuffers.hpp').lower()
-                    save_cbuffer(cbuffer_filename, cb)
+                    _save_cbuffer(cbuffer_filename, cb)
 
                 if shader_file in LAST_FAIL_TIME:
                     del(LAST_FAIL_TIME[shader_file])
 
     if len(compile_res['fail']) == 0:
-        save_manifest(root, cbuffers, cbuffer_meta)
+        _save_manifest(root, cbuffers, cbuffer_meta)
     return compile_res
 
 parser = argparse.ArgumentParser()
@@ -470,14 +470,14 @@ CBUFFER_NAMESPACE = args.constant_buffer
 try:
     prev_files = set()
     while True:
-        safe_mkdir(OUT_DIR)
+        _safe_mkdir(OUT_DIR)
         cur_files = set()
         first_tick = True
         for full_path in glob.glob(os.path.join(SHADER_DIR, '*.hlsl')):
             _, filename = os.path.split(full_path)
             root, ext = os.path.splitext(filename)
             cur_files.add(root)
-            if should_compile(full_path):
+            if _should_compile(full_path):
                 # If first modified file, print header
                 if first_tick:
                     first_tick = False
@@ -486,7 +486,7 @@ try:
                         ll.tm_hour, ll.tm_min, ll.tm_sec)
                 # the hlsl file has changed, so reparse it's deps and entry
                 # points
-                entry_points, deps, cbuffer_meta = parse_hlsl_file(full_path)
+                entry_points, deps, cbuffer_meta = _parse_hlsl_file(full_path)
                 SHADERS[root] = entry_points
                 DEPS[root] = deps
 
@@ -496,7 +496,7 @@ try:
                         dependant = m.groups()[0]
                         DEPS[root].add(dependant)
 
-                compile(full_path, root, cbuffer_meta)
+                _compile(full_path, root, cbuffer_meta)
 
         # purge data from files that no longer exist
         for root in prev_files.difference(cur_files):
