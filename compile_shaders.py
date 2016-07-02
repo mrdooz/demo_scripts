@@ -10,6 +10,7 @@ import re
 import inc_bin
 import argparse
 
+FXC_PATH = 'C:/Program Files (x86)/Windows Kits/8.1/bin/x86/fxc.exe'
 ENTRY_POINT_TAG = 'entry-point'
 SHADER_DECL_RE = re.compile('(.+)? (.+)\(.*')
 ENTRY_POINT_RE = re.compile('// entry-point: (.+)')
@@ -41,6 +42,8 @@ SHADER_DATA = {
 # conversion between HLSL and my types
 KNOWN_TYPES = {
     'float': {'type': 'float', 'size': 1},
+    'int': {'type': 'int', 'size': 1},
+    'uint': {'type': 'u32', 'size': 1},
     'float2': {'type': 'vec2', 'size': 2},
     'float3': {'type': 'vec3', 'size': 3},
     'float4': {'type': 'vec4', 'size': 4},
@@ -202,8 +205,9 @@ def _parse_cbuffer(basename, asm_filename):
             }
             continue
         elif line.startswith('}'):
-            cbuffers.append(cur_cbuffer)
-            cur_cbuffer = None
+            if cur_cbuffer:
+                cbuffers.append(cur_cbuffer)
+                cur_cbuffer = None
             continue
         elif line.startswith('Input signature:'):
             cur_input_sig = True
@@ -232,11 +236,28 @@ def _parse_cbuffer(basename, asm_filename):
         if comments.find('[unused]') != -1:
             cur_cbuffer['unused'] += 1
         var_type, _, var_name = tmp.partition(' ')
+        # NB: we don't do any kind of filtering on lines, so this will match
+        # '{' etc, which should be fine, as this won't match a valid type..
+        # print 'line: %s\ntype: %s, name: %s' % (line, var_type, var_name)
         if not var_type or not var_name:
             continue
+
+        # check if the type is an array type
+        array_size = 1
+        if '[' in var_name and ']' in var_name:
+            open_idx = var_name.find('[')
+            close_idx = var_name.find(']')
+            array_size = int(var_name[open_idx+1:close_idx])
+            var_name = var_name[:open_idx]
         if var_type not in KNOWN_TYPES:
             continue
-        cur_cbuffer['vars'][var_name] = (KNOWN_TYPES[var_type], comments)
+
+        cur_cbuffer['vars'][var_name] = {
+            'type': KNOWN_TYPES[var_type]['type'],
+            'size': KNOWN_TYPES[var_type]['size'],
+            'array_size': array_size,
+            'comments': comments
+        }
 
     return cbuffers
 
@@ -259,15 +280,23 @@ def _save_cbuffer(cbuffer_filename, cbuffers):
 
         # calc max line length to align the comments
         max_len = 0
-        for n, (var_data, comments) in vars.iteritems():
+        for n, var_data in vars.iteritems():
             t = var_data['type']
             max_len = max(max_len, len(n) + len(t))
 
         padder = 0
         slots_left = 4
-        for n, (var_data, comments) in vars.iteritems():
+        for var_name, var_data in vars.iteritems():
             var_type = var_data['type']
-            var_size = var_data.get('size', None)
+            var_size = var_data['size']
+            array_size = var_data['array_size']
+            comments = var_data['comments']
+
+            # adjust var size, and var name based on array size
+            if array_size > 1:
+                var_size *= array_size
+                var_name = '%s[%d]' % (var_name, array_size)
+
             # if the current variable doesn't fit in the remaining slots,
             # align it
             if (slots_left != 4 and slots_left - var_size < 0):
@@ -277,9 +306,9 @@ def _save_cbuffer(cbuffer_filename, cbuffers):
                 )
                 padder += 1
                 slots_left = 4
-            cur_len = len(n) + len(var_type)
+            cur_len = len(var_name) + len(var_type)
             padding = (max_len - cur_len + 8) * ' '
-            cur += '      %s %s;%s%s\n' % (var_type, n, padding, comments)
+            cur += '      %s %s;%s%s\n' % (var_type, var_name, padding, comments)
             slots_left -= (var_size % 4)
             if slots_left == 0:
                 slots_left = 4
@@ -408,7 +437,7 @@ def _compile(full_path, root, cbuffer_meta):
                 # create debug shader
                 # returns 0 on success, > 0 otherwise
                 res = subprocess.call([
-                    'fxc',
+                    FXC_PATH,
                     '/nologo',
                     '/T%s_5_0' % profile,
                     '/Od',
@@ -420,7 +449,7 @@ def _compile(full_path, root, cbuffer_meta):
             else:
                 # create optimized shader
                 res = subprocess.call([
-                    'fxc',
+                    FXC_PATH,
                     '/nologo',
                     '/T%s_5_0' % profile,
                     '/O3',
