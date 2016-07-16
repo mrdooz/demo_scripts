@@ -69,6 +69,25 @@ $cbuffers
 }
 """)
 
+FULLSCREEN_CBUFFER = """cbuffer cbFullscreen : register(c0)
+{
+    float2 g_dim;
+    float2 g_time;
+};
+"""
+
+CBUFFER_HLSL_TEMMPLATE = Template("""cbuffer $name : register(c$register)
+{
+$vars
+};
+""")
+
+
+def replace_ext(full_path, new_ext):
+    # NB, new_ext doesn't include the '.'
+    root, _ = os.path.splitext(full_path)
+    return root + '.' + new_ext
+
 
 def _safe_mkdir(path):
     try:
@@ -82,7 +101,7 @@ def _parse_hlsl_file(f):
     # - entry points
     # - dependencies
     # - cbuffer meta
-    res = defaultdict(list)
+    entry_points_per_type = defaultdict(list)
     deps = set()
     cbuffer_meta = defaultdict(dict)
     cbuffer_shader = None
@@ -90,6 +109,7 @@ def _parse_hlsl_file(f):
     _, filename = os.path.split(f)
     entry_point_type = None
     full_screen_entry_point = None
+
     for r in open(f, 'rt').readlines():
         r = r.strip()
 
@@ -134,7 +154,8 @@ def _parse_hlsl_file(f):
             m = SHADER_DECL_RE.match(r)
             if m:
                 name = m.groups()[1]
-                res[entry_point_type].append((name, full_screen_entry_point))
+                entry_points_per_type[entry_point_type].append(
+                    (name, full_screen_entry_point))
             entry_point_type = None
             full_screen_entry_point = None
         else:
@@ -148,13 +169,73 @@ def _parse_hlsl_file(f):
                     # found correct entry point tag
                     entry_point_type = t
                 else:
-                    print 'Unknown tag type: %s' % t
+                    print('Unknown tag type: %s' % t)
             else:
                 m = DEPS_RE.match(r)
                 if m:
                     deps.add(m.groups()[0])
 
-    return res, deps, cbuffer_meta
+    return entry_points_per_type, deps, cbuffer_meta
+
+
+def _parse_meta_file(filename):
+    """
+    Parse the meta file, and create a cbuffer file
+    """
+
+    seen_keys = set()
+    cur_var = {}
+    cbuffer_vars = []
+    cbuffers = []
+
+    for line in open(filename).readlines():
+        line = line.strip()
+        if not line or line[0] == '#':
+            continue
+
+        # all meta lines are of the form: 'key : value'
+        k, _, v = line.partition(':')
+        v = v.strip()
+
+        if k == 'fullscreen' and v.lower() == 'true':
+            # fullscreen effects need an addition cbuffer with dims/time
+            cbuffers.append(FULLSCREEN_CBUFFER)
+            continue
+
+        if k in seen_keys:
+            # second time we see a key, so this is a new cbuffer
+            cbuffer_vars.append(cur_var)
+            cur_var = {}
+            seen_keys = set()
+
+        seen_keys.add(k)
+        cur_var[k] = v
+
+    cbuffer_vars.append(cur_var)
+
+    # create all the rows in the cbuffer
+    rows = []
+    max_len = 0
+    for r in cbuffer_vars:
+        cur = '%s %s;' % (r['type'], r['name'])
+        rows.append(cur)
+        max_len = max(max_len, len(cur))
+
+    # add the row comments, using the max_len to align them nicely :)
+    for i, r in enumerate(rows):
+        diff = max_len - len(r)
+        rows[i] = (
+            '    ' + r + ' ' * (4 + diff) +
+            '// ' + cbuffer_vars[i].get('comment', ''))
+
+    cbuffers.append(CBUFFER_HLSL_TEMMPLATE.substitute(
+        name='cbMeta',
+        register=len(cbuffers),
+        vars='\n'.join(rows)))
+
+    # write the cbuffer file
+    with open(replace_ext(filename, 'cbuffers.hlsl'), 'wt') as f:
+        f.write('\n'.join(cbuffers))
 
 
 def _generate_filenames(base, entry_points, obj_ext, asm_ext):
@@ -170,7 +251,9 @@ def _generate_filenames(base, entry_points, obj_ext, asm_ext):
 
 
 def _parse_cbuffer(basename, asm_filename):
-    # Parses the asm-file, and collects the cbuffer variables
+    """
+    Parses the asm-file, and collects the cbuffer variables
+    """
 
     cbuffer_prefix = basename.title().replace('.', '')
 
@@ -181,7 +264,7 @@ def _parse_cbuffer(basename, asm_filename):
         with open(asm_filename) as f:
             lines = f.readlines()
     except:
-        print 'file not found parsing cbuffers: %s' % asm_filename
+        print('file not found parsing cbuffers: %s' % asm_filename)
         return
 
     skip_count = 0
@@ -308,7 +391,8 @@ def _save_cbuffer(cbuffer_filename, cbuffers):
                 slots_left = 4
             cur_len = len(var_name) + len(var_type)
             padding = (max_len - cur_len + 8) * ' '
-            cur += '      %s %s;%s%s\n' % (var_type, var_name, padding, comments)
+            cur += (
+                '      %s %s;%s%s\n' % (var_type, var_name, padding, comments))
             slots_left -= (var_size % 4)
             if slots_left == 0:
                 slots_left = 4
@@ -396,7 +480,6 @@ def _should_compile(full_path):
     if not os.path.exists(status_file):
         return True
 
-    # status = open(status_file, 'rt').readline().strip()
     status_date = os.path.getmtime(status_file)
     hlsl_date = os.path.getmtime(full_path)
 
@@ -404,6 +487,11 @@ def _should_compile(full_path):
     for dep in DEPS[root]:
         full_dep = os.path.join(path, dep)
         hlsl_date = max(hlsl_date, os.path.getmtime(full_dep))
+
+    # if there's an assoicated .meta file, check that date too
+    meta_file = replace_ext(full_path, 'meta')
+    if os.path.exists(meta_file):
+        hlsl_date = max(hlsl_date, os.path.getmtime(meta_file))
 
     return status_date < hlsl_date
 
@@ -463,7 +551,7 @@ def _compile(full_path, root, cbuffer_meta):
             if res:
                 # if compilation failed, don't try again until the
                 # .hlsl file has been updated
-                print '** FAILURE: %s, %s' % (shader_file, entry_point)
+                print('** FAILURE: %s, %s' % (shader_file, entry_point))
                 LAST_FAIL_TIME[shader_file] = hlsl_file_time
                 compile_res['fail'].add(entry_point)
             else:
@@ -507,15 +595,18 @@ try:
             root, ext = os.path.splitext(filename)
             cur_files.add(root)
             if _should_compile(full_path):
-                # If first modified file, print header
+                # If this is the first file we're processing, print the header
                 if first_tick:
                     first_tick = False
                     ll = time.localtime()
-                    print '==> COMPILE STARTED AT [%.2d:%.2d:%.2d]' % (
-                        ll.tm_hour, ll.tm_min, ll.tm_sec)
-                # the hlsl file has changed, so reparse it's deps and entry
+                    print('==> COMPILE STARTED AT [%.2d:%.2d:%.2d]' % (
+                        ll.tm_hour, ll.tm_min, ll.tm_sec))
+                # the hlsl file has changed, so reparse its deps and entry
                 # points
                 entry_points, deps, cbuffer_meta = _parse_hlsl_file(full_path)
+                meta_file = replace_ext(full_path, 'meta')
+                if os.path.exists(meta_file):
+                    _parse_meta_file(meta_file)
                 SHADERS[root] = entry_points
                 DEPS[root] = deps
 
@@ -538,5 +629,5 @@ try:
 
         time.sleep(1)
 except KeyboardInterrupt:
-    print 'Exiting'
+    print('Exiting')
     exit(1)
