@@ -213,11 +213,18 @@ def _parse_meta_file(filename):
 
     cbuffer_vars.append(cur_var)
 
+    # create mapping for any types where the c++ and hlsl type names don't
+    # agree
+    type_mapping = {
+        'color': 'float4'
+    }
+
     # create all the rows in the cbuffer
     rows = []
     max_len = 0
     for r in cbuffer_vars:
-        cur = '%s %s;' % (r['type'], r['name'])
+        var_type = type_mapping.get(r['type'], r['type'])
+        cur = '%s %s;' % (var_type, r['name'])
         rows.append(cur)
         max_len = max(max_len, len(cur))
 
