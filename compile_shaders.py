@@ -7,21 +7,14 @@ import subprocess
 from collections import OrderedDict, defaultdict
 from string import Template
 import re
-import inc_bin
 import argparse
 
 FXC_PATH = 'C:/Program Files (x86)/Windows Kits/8.1/bin/x86/fxc.exe'
-ENTRY_POINT_TAG = 'entry-point'
-SHADER_DECL_RE = re.compile('(.+)? (.+)\(.*')
+SHADER_DECL_RE = re.compile('(.+)? (.+)\(.*')   # return-type shader-name(args)
 ENTRY_POINT_RE = re.compile('// entry-point: (.+)')
-FULL_SCREEN_ENTRY_POINT_RE = re.compile('// full-screen-entry-point: (.+)')
-CBUFFER_META_BEGIN_RE = re.compile('// cb-meta-begin: (.+)')
-CBUFFER_META_END_RE = re.compile('// cb-meta-end')
-CBUFFER_RANGE_RE = re.compile('// (.+): range: (.+)\.\.(.+)')
-CBUFFER_TYPE_RE = re.compile('// (.+): type: (.+)')
 # cbuffer cbRadialGradient : register(b1)
 CBUFFER_RE = re.compile('cbuffer (.+) : .+')
-DEPS_RE = re.compile('#include "(.+?)"')
+INCLUDE_RE = re.compile('#include "(.+?)"')
 
 # for each file, contain list of entry-points by shader type
 SHADERS = {}
@@ -31,6 +24,7 @@ LAST_FAIL_TIME = {}
 
 SHADER_DIR = None
 OUT_DIR = None
+INC_DIR = None
 
 SHADER_DATA = {
     'vs': {'profile': 'vs', 'obj_ext': 'vso', 'asm_ext': 'vsa'},
@@ -44,11 +38,11 @@ KNOWN_TYPES = {
     'float': {'type': 'float', 'size': 1},
     'int': {'type': 'int', 'size': 1},
     'uint': {'type': 'u32', 'size': 1},
-    'float2': {'type': 'vec2', 'size': 2},
-    'float3': {'type': 'vec3', 'size': 3},
-    'float4': {'type': 'vec4', 'size': 4},
-    'float4x4': {'type': 'mtx4x4', 'size': 16},
-    'matrix': {'type': 'mtx4x4', 'size': 16},
+    'float2': {'type': 'float2', 'size': 2},
+    'float3': {'type': 'float3', 'size': 3},
+    'float4': {'type': 'float4', 'size': 4},
+    'float4x4': {'type': 'float4x4', 'size': 16},
+    'matrix': {'type': 'float4x4', 'size': 16},
 }
 
 CBUFFER_NAMESPACE = None
@@ -108,7 +102,6 @@ def _parse_hlsl_file(f):
     parse_cbuffer_header = False
     _, filename = os.path.split(f)
     entry_point_type = None
-    full_screen_entry_point = None
 
     for r in open(f, 'rt').readlines():
         r = r.strip()
@@ -116,134 +109,36 @@ def _parse_hlsl_file(f):
         if parse_cbuffer_header:
             # the previous row was a cbuffer meta end, so we parse the cbuffer
             # definition now to get the name
-            m = CBUFFER_RE.match(r)
+            m = CBUFFER_RE.match(r)     # re.compile('cbuffer (.+) : .+')
             if m:
                 cbuffer_meta[cbuffer_shader]['cbuffer'] = m.groups()[0]
             parse_cbuffer_header = False
             cbuffer_shader = None
             continue
 
-        # Check for c-buffer meta data
-        if cbuffer_shader:
-            if CBUFFER_META_END_RE.match(r):
-                parse_cbuffer_header = True
-                continue
-
-            m = CBUFFER_RANGE_RE.match(r)
-            if m:
-                g = m.groups()
-                cbuffer_meta[cbuffer_shader][g[0]]['range'] = [
-                    float(g[1]), float(g[2])]
-
-            m = CBUFFER_TYPE_RE.match(r)
-            if m:
-                g = m.groups()
-                cbuffer_meta[cbuffer_shader][g[0]]['type'] = g[1]
-            continue
-
-        m = CBUFFER_META_BEGIN_RE.match(r)
-        if m:
-            # associate this cbuffer with a shader, and create the cbuffer
-            # dict
-            cbuffer_shader = m.groups()[0]
-            cbuffer_meta[cbuffer_shader] = defaultdict(dict)
-
-        elif entry_point_type:
+        if  entry_point_type:
             # previous row was an entry point, so parse the entry point
             # name
-            m = SHADER_DECL_RE.match(r)
+            m = SHADER_DECL_RE.match(r)     # re.compile('(.+)? (.+)\(.*')
             if m:
                 name = m.groups()[1]
-                entry_points_per_type[entry_point_type].append(
-                    (name, full_screen_entry_point))
+                entry_points_per_type[entry_point_type].append((name, None))
             entry_point_type = None
-            full_screen_entry_point = None
         else:
-            m0 = ENTRY_POINT_RE.match(r)
-            m1 = FULL_SCREEN_ENTRY_POINT_RE.match(r)
-            full_screen_entry_point = m1 is not None
-            if m0 or m1:
-                m = m0 if m0 else m1
+            m = ENTRY_POINT_RE.match(r)     # re.compile('// entry-point: (.+)')
+            if m:
                 t = m.groups()[0]
                 if t in ('vs', 'ps', 'gs', 'cs'):
                     # found correct entry point tag
                     entry_point_type = t
                 else:
-                    print('Unknown tag type: %s' % t)
+                    print('Unknown tag type found in entry-point: %s' % t)
             else:
-                m = DEPS_RE.match(r)
+                m = INCLUDE_RE.match(r)    # re.compile('#include "(.+?)"')
                 if m:
                     deps.add(m.groups()[0])
 
     return entry_points_per_type, deps, cbuffer_meta
-
-
-def _parse_meta_file(filename):
-    """
-    Parse the meta file, and create a cbuffer file
-    """
-
-    seen_keys = set()
-    cur_var = {}
-    cbuffer_vars = []
-    cbuffers = []
-
-    for line in open(filename).readlines():
-        line = line.strip()
-        if not line or line[0] == '#':
-            continue
-
-        # all meta lines are of the form: 'key : value'
-        k, _, v = line.partition(':')
-        v = v.strip()
-
-        if k == 'fullscreen' and v.lower() == 'true':
-            # fullscreen effects need an addition cbuffer with dims/time
-            cbuffers.append(FULLSCREEN_CBUFFER)
-            continue
-
-        if k in seen_keys:
-            # second time we see a key, so this is a new cbuffer
-            cbuffer_vars.append(cur_var)
-            cur_var = {}
-            seen_keys = set()
-
-        seen_keys.add(k)
-        cur_var[k] = v
-
-    cbuffer_vars.append(cur_var)
-
-    # create mapping for any types where the c++ and hlsl type names don't
-    # agree
-    type_mapping = {
-        'color': 'float4'
-    }
-
-    # create all the rows in the cbuffer
-    rows = []
-    max_len = 0
-    for r in cbuffer_vars:
-        var_type = type_mapping.get(r['type'], r['type'])
-        cur = '%s %s;' % (var_type, r['name'])
-        rows.append(cur)
-        max_len = max(max_len, len(cur))
-
-    # add the row comments, using the max_len to align them nicely :)
-    for i, r in enumerate(rows):
-        diff = max_len - len(r)
-        rows[i] = (
-            '    ' + r + ' ' * (4 + diff) +
-            '// ' + cbuffer_vars[i].get('comment', ''))
-
-    cbuffers.append(CBUFFER_HLSL_TEMMPLATE.substitute(
-        name='cbMeta',
-        register=len(cbuffers),
-        vars='\n'.join(rows)))
-
-    # write the cbuffer file
-    with open(replace_ext(filename, 'cbuffers.hlsl'), 'wt') as f:
-        f.write('\n'.join(cbuffers))
-
 
 def _generate_filenames(base, entry_points, obj_ext, asm_ext):
     # returns the output files from the given base and entry points
@@ -431,54 +326,6 @@ def _save_cbuffer(cbuffer_filename, cbuffers):
                 f.write(res)
 
 
-def _save_manifest(root, cbuffers, cbuffer_meta):
-    # the manifest contains information about all the (pixel) shaders in a
-    # hlsl file, along with the cbuffer data. the idea is that using this
-    # data, we can automatically load shaders and create imgui displays for
-    # them.
-    manifest_file = os.path.join(OUT_DIR, root + '.manifest')
-    with open(manifest_file, 'wt') as f:
-        for shader in SHADERS.get(root, {}).get('ps', []):
-            shader, is_fullscreen = shader
-            # only write manifests for fullscreen shaders with cbuffer meta
-            # data
-            meta = cbuffer_meta.get(shader)
-            if not is_fullscreen or not meta:
-                continue
-            f.write('shader-begin name: %s file: %s\n' % (
-                shader, os.path.join(OUT_DIR, root + '_' + shader + '.pso')))
-
-            f.write('cbuffer-begin\n')
-            # for the current shader, find the cbuffer with associated meta
-            cur_cbuffer = cbuffer_meta[shader]['cbuffer']
-
-            for cbs in cbuffers.get(shader, {}):
-                if cbs['root'] != cur_cbuffer:
-                    continue
-
-                for key, value in cbs.get('vars', {}).iteritems():
-                    # look for metadata associated with the current var
-                    if key in meta:
-                        if 'type' in meta[key]:
-                            val_type = meta[key]['type']
-                        else:
-                            val_type = value[0]['type']
-
-                        if 'range' in meta[key]:
-                            m = meta[key]
-                            f.write(
-                                'name: %s type: %s min: %s max: %s\n' % (
-                                    key, val_type,
-                                    m['range'][0], m['range'][1]))
-                        else:
-                            f.write('name: %s type: %s\n' % (key, val_type))
-                    else:
-                        f.write(
-                            'name: %s type: %s\n' % (key, value[0]['type']))
-            f.write('cbuffer-end\n')
-            f.write('shader-end\n')
-
-
 def _should_compile(full_path):
     # first step is to see if the shader has a .status file - if it doesn't
     # then it's never been compiled
@@ -524,6 +371,7 @@ def _compile(full_path, root, cbuffer_meta):
         g = _generate_filenames(root, entry_points, obj_ext, asm_ext)
         for output, entry_point, is_debug in g:
             out_root = os.path.join(OUT_DIR, root + '_' + entry_point)
+            inc_root = os.path.join(INC_DIR, root + '_' + entry_point)
             suffix = 'D' if is_debug else ''
             obj_file = out_root + suffix + '.' + obj_ext
             asm_file = out_root + suffix + '.' + asm_ext
@@ -563,40 +411,39 @@ def _compile(full_path, root, cbuffer_meta):
                 compile_res['fail'].add(entry_point)
             else:
                 compile_res['ok'].add(entry_point)
-                if not is_debug:
-                    inc_bin.dump_bin(obj_file)
 
                 if is_debug:
                     cb = _parse_cbuffer(root, asm_file)
                     if shader_type == 'ps':
                         cbuffers[entry_point] = cb
-                    cbuffer_filename = (out_root + '.cbuffers.hpp').lower()
+                    cbuffer_filename = (inc_root + '.cbuffers.hpp').lower()
                     _save_cbuffer(cbuffer_filename, cb)
 
                 if shader_file in LAST_FAIL_TIME:
                     del(LAST_FAIL_TIME[shader_file])
 
-    if len(compile_res['fail']) == 0:
-        _save_manifest(root, cbuffers, cbuffer_meta)
     return compile_res
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-d', '--shader-dir', default='shaders')
 parser.add_argument('-o', '--out-dir', default='out')
-parser.add_argument('-bin', '--binary', action='store_true')
-parser.add_argument(
-    '-cb', '--constant-buffer', help='Constant buffer namespace')
+parser.add_argument('-i', '--inc-dir', default='inc')
+parser.add_argument('-cb', '--constant-buffer', help='Constant buffer namespace')
 args = parser.parse_args()
 SHADER_DIR = args.shader_dir
 OUT_DIR = os.path.join(args.shader_dir, args.out_dir)
+INC_DIR = os.path.join(args.shader_dir, args.inc_dir)
 CBUFFER_NAMESPACE = args.constant_buffer
 
 try:
     prev_files = set()
     while True:
         _safe_mkdir(OUT_DIR)
+        _safe_mkdir(INC_DIR)
+
         cur_files = set()
         first_tick = True
+
         for full_path in glob.glob(os.path.join(SHADER_DIR, '*.hlsl')):
             _, filename = os.path.split(full_path)
             root, ext = os.path.splitext(filename)
@@ -611,14 +458,11 @@ try:
                 # the hlsl file has changed, so reparse its deps and entry
                 # points
                 entry_points, deps, cbuffer_meta = _parse_hlsl_file(full_path)
-                meta_file = replace_ext(full_path, 'meta')
-                if os.path.exists(meta_file):
-                    _parse_meta_file(meta_file)
                 SHADERS[root] = entry_points
                 DEPS[root] = deps
 
                 for row in open(full_path).readlines():
-                    m = DEPS_RE.match(row)
+                    m = INCLUDE_RE.match(row)
                     if m:
                         dependant = m.groups()[0]
                         DEPS[root].add(dependant)
